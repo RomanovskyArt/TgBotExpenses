@@ -514,15 +514,23 @@ router = Router()
 @router.message(CommandStart())
 async def on_start(msg: Message):
     ensure_user(msg.from_user.id, msg.from_user.username)
-    await msg.answer(
+    base = (
         "Привет! Я бот для учёта расходов.\n\n"
         "Просто напиши: <b>кофе 300</b> — и я спрошу категорию.\n\n"
-        "Команды:\n"
+        "<b>Команды:</b>\n"
         "/stats — статистика\n"
         "/categories — управление категориями\n"
-        "/help — помощь",
-        reply_markup=pro_inline_kb(msg.from_user.id),
+        "/help — помощь"
     )
+    if is_user_pro(msg.from_user.id):
+        base += (
+            "\n\n<b>⭐ Pro:</b>\n"
+            "/limits — лимиты по категориям\n"
+            "/recs — регулярные платежи\n"
+            "/export — выгрузить CSV\n"
+            "🧠 Автокатегоризация работает сама после 3 одинаковых выборов"
+        )
+    await msg.answer(base, reply_markup=pro_inline_kb(msg.from_user.id))
 
 
 @router.message(Command("help"))
