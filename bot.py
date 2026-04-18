@@ -15,7 +15,7 @@ from typing import Optional
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -103,6 +103,31 @@ def db_init() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_exp_user_created
                 ON expenses(user_id, created_at);
+
+            CREATE TABLE IF NOT EXISTS auto_cat (
+                user_id     INTEGER NOT NULL,
+                keyword     TEXT NOT NULL,
+                category_id INTEGER NOT NULL,
+                hits        INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, keyword, category_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS limits (
+                user_id       INTEGER NOT NULL,
+                category_id   INTEGER NOT NULL,
+                monthly_limit REAL NOT NULL,
+                PRIMARY KEY (user_id, category_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS recurring (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER NOT NULL,
+                name          TEXT NOT NULL,
+                amount        REAL NOT NULL,
+                category_id   INTEGER NOT NULL,
+                day_of_month  INTEGER NOT NULL,
+                last_run_date TEXT
+            );
             """
         )
         # Миграция: колонки подписки Pro
@@ -152,6 +177,160 @@ def ensure_user(user_id: int, username: Optional[str]) -> None:
                 "UPDATE users SET username = ? WHERE user_id = ?",
                 (username, user_id),
             )
+
+
+# ---------- Pro: автокатегоризация ----------
+def _keyword(comment: str) -> str:
+    """Первое слово комментария, lowercased, без пунктуации."""
+    import string
+    s = (comment or "").strip().lower()
+    if not s:
+        return ""
+    first = s.split()[0]
+    return first.strip(string.punctuation + "«»—–")
+
+
+AUTO_THRESHOLD = 3  # сколько раз надо выбрать категорию для слова, чтобы включилось авто
+
+
+def auto_category_for(user_id: int, comment: str):
+    """Возвращает category_id если по комменту уже известна авто-категория, иначе None."""
+    kw = _keyword(comment)
+    if not kw:
+        return None
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT category_id, hits FROM auto_cat "
+            "WHERE user_id = ? AND keyword = ? "
+            "ORDER BY hits DESC LIMIT 1",
+            (user_id, kw),
+        ).fetchone()
+    if row and row[1] >= AUTO_THRESHOLD:
+        return row[0]
+    return None
+
+
+def bump_auto_counter(user_id: int, comment: str, category_id: int) -> None:
+    kw = _keyword(comment)
+    if not kw:
+        return
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO auto_cat(user_id, keyword, category_id, hits) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(user_id, keyword, category_id) DO UPDATE SET hits = hits + 1",
+            (user_id, kw, category_id),
+        )
+
+
+# ---------- Pro: лимиты ----------
+def set_limit(user_id: int, category_id: int, amount: float) -> None:
+    with closing(db_connect()) as conn, conn:
+        if amount <= 0:
+            conn.execute(
+                "DELETE FROM limits WHERE user_id = ? AND category_id = ?",
+                (user_id, category_id),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO limits(user_id, category_id, monthly_limit) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id, category_id) DO UPDATE SET monthly_limit = excluded.monthly_limit",
+                (user_id, category_id, amount),
+            )
+
+
+def list_limits(user_id: int):
+    """Возвращает [(category_id, emoji, name, limit, spent)]"""
+    start_of_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            "SELECT c.id, c.emoji, c.name, l.monthly_limit, "
+            "  COALESCE(("
+            "    SELECT SUM(e.amount) FROM expenses e "
+            "    WHERE e.user_id = l.user_id AND e.category_id = l.category_id "
+            "      AND e.created_at >= ?"
+            "  ), 0) AS spent "
+            "FROM limits l JOIN categories c ON c.id = l.category_id "
+            "WHERE l.user_id = ? ORDER BY c.id",
+            (start_of_month.strftime("%Y-%m-%d %H:%M:%S"), user_id),
+        ).fetchall()
+    return rows
+
+
+def month_spent(user_id: int, category_id: int) -> float:
+    start_of_month = datetime.now().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM expenses "
+            "WHERE user_id = ? AND category_id = ? AND created_at >= ?",
+            (user_id, category_id, start_of_month.strftime("%Y-%m-%d %H:%M:%S")),
+        ).fetchone()
+    return row[0] or 0.0
+
+
+def get_limit(user_id: int, category_id: int):
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT monthly_limit FROM limits WHERE user_id = ? AND category_id = ?",
+            (user_id, category_id),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def limit_warning(user_id: int, category_id: int) -> Optional[str]:
+    """Текст предупреждения после добавления траты, или None."""
+    lim = get_limit(user_id, category_id)
+    if not lim:
+        return None
+    spent = month_spent(user_id, category_id)
+    pct = spent / lim * 100
+    if spent >= lim:
+        over = spent - lim
+        return f"🚨 Лимит превышен на <b>{over:g}</b> ({pct:.0f}% от {lim:g})"
+    if pct >= 80:
+        left = lim - spent
+        return f"⚠️ Потрачено {pct:.0f}% лимита. Осталось <b>{left:g}</b>"
+    return None
+
+
+# ---------- Pro: регулярные платежи ----------
+def add_recurring(user_id: int, name: str, amount: float,
+                  category_id: int, day: int) -> int:
+    with closing(db_connect()) as conn, conn:
+        cur = conn.execute(
+            "INSERT INTO recurring(user_id, name, amount, category_id, day_of_month) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, name, amount, category_id, day),
+        )
+        return cur.lastrowid
+
+
+def list_recurring(user_id: int):
+    with closing(db_connect()) as conn:
+        return conn.execute(
+            "SELECT r.id, r.name, r.amount, c.emoji, c.name, r.day_of_month "
+            "FROM recurring r JOIN categories c ON c.id = r.category_id "
+            "WHERE r.user_id = ? ORDER BY r.day_of_month, r.id",
+            (user_id,),
+        ).fetchall()
+
+
+def delete_recurring(rec_id: int, user_id: int) -> bool:
+    with closing(db_connect()) as conn, conn:
+        cur = conn.execute(
+            "DELETE FROM recurring WHERE id = ? AND user_id = ?",
+            (rec_id, user_id),
+        )
+        return cur.rowcount > 0
+
+
+def find_category_by_name(user_id: int, name: str):
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT id, emoji, name FROM categories "
+            "WHERE user_id = ? AND lower(name) = lower(?)",
+            (user_id, name),
+        ).fetchone()
+    return row
 
 
 def list_categories(user_id: int):
@@ -289,6 +468,19 @@ def stats_kb() -> InlineKeyboardMarkup:
     )
 
 
+async def require_pro(msg: Message) -> bool:
+    """Возвращает True если юзер Pro. Иначе шлёт offer и возвращает False."""
+    if is_user_pro(msg.from_user.id):
+        return True
+    await msg.answer(
+        "🔒 Эта фича доступна только с <b>Pro</b>-подпиской.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text=PRO_BUTTON_TEXT, callback_data="buy_pro")
+        ]]),
+    )
+    return False
+
+
 def pro_inline_kb(user_id: int):
     """Inline-кнопка Pro под сообщением. None — если юзер уже Pro."""
     if is_user_pro(user_id):
@@ -335,18 +527,42 @@ async def on_start(msg: Message):
 
 @router.message(Command("help"))
 async def on_help(msg: Message):
-    await msg.answer(
+    is_pro = is_user_pro(msg.from_user.id)
+    base = (
         "Формат записи расхода:\n"
         "<code>комментарий сумма</code>\n\n"
         "Примеры:\n"
         "• <code>кофе 300</code>\n"
         "• <code>такси домой 1500</code>\n"
         "• <code>450</code> (без комментария)\n\n"
-        "Команды:\n"
+        "<b>Основное:</b>\n"
         "/stats — статистика расходов\n"
         "/categories — категории\n"
         "/cancel — отменить текущее действие"
     )
+    pro = (
+        "\n\n<b>⭐ Pro:</b>\n"
+        "🧠 <b>Автокатегоризация</b> — после 3 одинаковых выборов слово запоминается\n"
+        "💰 Лимиты:\n"
+        "• <code>/limit Еда 15000</code> — поставить лимит\n"
+        "• <code>/limit Еда 0</code> — удалить\n"
+        "• /limits — все лимиты с прогрессом\n"
+        "🔁 Регулярные:\n"
+        "• <code>/rec аренда 45000 Жильё 1</code> — каждое 1-е число\n"
+        "• /recs — список\n"
+        "• <code>/delrec_3</code> — удалить\n"
+        "📄 /export — скачать CSV со всеми расходами"
+    )
+    if is_pro:
+        await msg.answer(base + pro)
+    else:
+        await msg.answer(
+            base + "\n\n🔒 Ещё больше возможностей с Pro: автокатегоризация, "
+            "лимиты, регулярные платежи, экспорт в CSV.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=PRO_BUTTON_TEXT, callback_data="buy_pro")
+            ]]),
+        )
 
 
 @router.message(Command("cancel"))
@@ -469,16 +685,48 @@ async def cb_cancel_expense(cq: CallbackQuery):
 @router.callback_query(F.data.startswith("cat:"))
 async def cb_pick_category(cq: CallbackQuery):
     _, exp_id, cat_id = cq.data.split(":")
-    row = set_expense_category(int(exp_id), cq.from_user.id, int(cat_id))
+    exp_id, cat_id = int(exp_id), int(cat_id)
+    row = set_expense_category(exp_id, cq.from_user.id, cat_id)
     if row:
         amount, comment, emoji, name = row
+        # Pro: запоминаем выбор для автокатегоризации
+        if is_user_pro(cq.from_user.id) and comment:
+            bump_auto_counter(cq.from_user.id, comment, cat_id)
         text = f"✅ Записано: {emoji} {name} — <b>{amount:g}</b>"
         if comment:
             text += f"\n💬 {comment}"
+        # Pro: предупреждение о лимите
+        if is_user_pro(cq.from_user.id):
+            warn = limit_warning(cq.from_user.id, cat_id)
+            if warn:
+                text += f"\n\n{warn}"
     else:
         text = "✅ Записано."
     await cq.message.edit_text(text)
     await cq.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("recat:"))
+async def cb_recategorize(cq: CallbackQuery):
+    """Изменить категорию уже записанной авто-траты."""
+    exp_id = int(cq.data.split(":", 1)[1])
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT amount, comment FROM expenses WHERE id = ? AND user_id = ?",
+            (exp_id, cq.from_user.id),
+        ).fetchone()
+    if not row:
+        await cq.answer("Не найдено", show_alert=True)
+        return
+    amount, comment = row
+    preview = f"💸 <b>{amount:g}</b>"
+    if comment:
+        preview += f" — {comment}"
+    preview += "\n\nВыбери категорию:"
+    await cq.message.edit_text(
+        preview, reply_markup=categories_kb(cq.from_user.id, exp_id)
+    )
+    await cq.answer()
 
 
 # ----- Админка -----
@@ -580,6 +828,172 @@ async def cb_admin(cq: CallbackQuery):
     await cq.answer()
 
 
+# ----- Pro: лимиты -----
+@router.message(Command("limit"))
+async def on_limit(msg: Message, command: CommandObject):
+    if not await require_pro(msg):
+        return
+    args = (command.args or "").strip()
+    # Последний токен — число, всё до него — название категории
+    m = re.match(r"^(.*?)\s+(-?\d+(?:[.,]\d+)?)\s*$", args)
+    if not m:
+        await msg.answer(
+            "Использование:\n"
+            "<code>/limit Еда 15000</code> — лимит 15000/мес на «Еда»\n"
+            "<code>/limit Еда 0</code> — удалить лимит"
+        )
+        return
+    name = m.group(1).strip()
+    amount = float(m.group(2).replace(",", "."))
+    cat = find_category_by_name(msg.from_user.id, name)
+    if not cat:
+        await msg.answer(f"Категория «{name}» не найдена. Смотри /categories")
+        return
+    cat_id, emoji, cname = cat
+    set_limit(msg.from_user.id, cat_id, amount)
+    if amount <= 0:
+        await msg.answer(f"🗑 Лимит для {emoji} {cname} удалён.")
+    else:
+        await msg.answer(f"💰 Лимит для {emoji} {cname}: <b>{amount:g}</b>/мес")
+
+
+@router.message(Command("limits"))
+async def on_limits(msg: Message):
+    if not await require_pro(msg):
+        return
+    rows = list_limits(msg.from_user.id)
+    if not rows:
+        await msg.answer(
+            "Лимитов пока нет. Поставь:\n<code>/limit Еда 15000</code>"
+        )
+        return
+    lines = ["💰 <b>Лимиты на этот месяц</b>", ""]
+    for cid, emoji, name, lim, spent in rows:
+        pct = spent / lim * 100 if lim else 0
+        if pct >= 100:
+            dot = "🔴"
+        elif pct >= 80:
+            dot = "🟡"
+        else:
+            dot = "🟢"
+        lines.append(
+            f"{dot} {emoji} {name}: <b>{spent:g}</b> / {lim:g} ({pct:.0f}%)"
+        )
+    await msg.answer("\n".join(lines))
+
+
+# ----- Pro: регулярные платежи -----
+@router.message(Command("rec"))
+async def on_rec_add(msg: Message, command: CommandObject):
+    if not await require_pro(msg):
+        return
+    args = (command.args or "").strip()
+    # формат: <имя> <сумма> <категория> <день>
+    # День и сумма — числа, категория должна существовать. Парсим с конца.
+    # Берём последний токен как day, предпоследний — имя категории (1 слово), дальше сумма с конца, остальное — имя.
+    tokens = args.split()
+    if len(tokens) < 4:
+        await msg.answer(
+            "Использование:\n"
+            "<code>/rec аренда 45000 Жильё 1</code>\n"
+            "= <имя> <сумма> <категория одним словом> <день месяца 1-28>"
+        )
+        return
+    try:
+        day = int(tokens[-1])
+        cat_name = tokens[-2]
+        amount = float(tokens[-3].replace(",", "."))
+        name = " ".join(tokens[:-3])
+    except ValueError:
+        await msg.answer("Не смог разобрать. Формат: <code>/rec имя сумма категория день</code>")
+        return
+    if not (1 <= day <= 28):
+        await msg.answer("День месяца должен быть от 1 до 28.")
+        return
+    if amount <= 0:
+        await msg.answer("Сумма должна быть больше нуля.")
+        return
+    cat = find_category_by_name(msg.from_user.id, cat_name)
+    if not cat:
+        await msg.answer(f"Категория «{cat_name}» не найдена. Смотри /categories")
+        return
+    cat_id, emoji, cname = cat
+    rec_id = add_recurring(msg.from_user.id, name, amount, cat_id, day)
+    await msg.answer(
+        f"🔁 Добавлено #{rec_id}: <b>{name}</b> — {amount:g} → {emoji} {cname}, "
+        f"каждое {day}-е число."
+    )
+
+
+@router.message(Command("recs"))
+async def on_recs(msg: Message):
+    if not await require_pro(msg):
+        return
+    rows = list_recurring(msg.from_user.id)
+    if not rows:
+        await msg.answer(
+            "Регулярных платежей нет. Добавь:\n"
+            "<code>/rec аренда 45000 Жильё 1</code>"
+        )
+        return
+    lines = ["🔁 <b>Регулярные платежи</b>", ""]
+    for rid, name, amount, emoji, cname, day in rows:
+        lines.append(
+            f"#{rid}: <b>{name}</b> — {amount:g} → {emoji} {cname}, "
+            f"{day}-е число\n   удалить: /delrec_{rid}"
+        )
+    await msg.answer("\n\n".join([lines[0], "\n\n".join(lines[2:])]))
+
+
+@router.message(F.text.regexp(r"^/delrec_(\d+)$"))
+async def on_delrec(msg: Message):
+    if not await require_pro(msg):
+        return
+    rec_id = int(msg.text.split("_", 1)[1])
+    if delete_recurring(rec_id, msg.from_user.id):
+        await msg.answer(f"🗑 Регулярный платёж #{rec_id} удалён.")
+    else:
+        await msg.answer("Не найдено.")
+
+
+# ----- Pro: экспорт CSV -----
+@router.message(Command("export"))
+async def on_export(msg: Message):
+    if not await require_pro(msg):
+        return
+    import csv
+    import io
+    from aiogram.types import BufferedInputFile
+
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            "SELECT e.created_at, e.amount, COALESCE(c.name, ''), "
+            "       COALESCE(c.emoji, ''), e.comment "
+            "FROM expenses e LEFT JOIN categories c ON c.id = e.category_id "
+            "WHERE e.user_id = ? ORDER BY e.created_at",
+            (msg.from_user.id,),
+        ).fetchall()
+
+    if not rows:
+        await msg.answer("Расходов пока нет — нечего экспортировать.")
+        return
+
+    buf = io.StringIO()
+    # BOM для корректного открытия в Excel с кириллицей
+    buf.write("\ufeff")
+    writer = csv.writer(buf, delimiter=";")
+    writer.writerow(["Дата", "Сумма", "Категория", "Эмодзи", "Комментарий"])
+    for created_at, amount, cname, emoji, comment in rows:
+        writer.writerow([created_at, amount, cname, emoji, comment])
+
+    data = buf.getvalue().encode("utf-8")
+    filename = f"expenses_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    await msg.answer_document(
+        BufferedInputFile(data, filename=filename),
+        caption=f"📄 Экспорт: {len(rows)} записей",
+    )
+
+
 # ----- Pro-подписка (Telegram Stars) -----
 @router.callback_query(F.data == "buy_pro")
 async def cb_buy_pro(cq: CallbackQuery):
@@ -636,6 +1050,28 @@ async def on_text(msg: Message, state: FSMContext):
     if amount <= 0:
         await msg.answer("Сумма должна быть больше нуля.")
         return
+    # Pro: автокатегоризация — если бот уже знает слово, сразу сохраняем
+    if is_user_pro(msg.from_user.id):
+        auto_cat_id = auto_category_for(msg.from_user.id, comment)
+        if auto_cat_id is not None:
+            exp_id = save_expense(msg.from_user.id, auto_cat_id, amount, comment)
+            with closing(db_connect()) as conn:
+                row = conn.execute(
+                    "SELECT emoji, name FROM categories WHERE id = ?", (auto_cat_id,)
+                ).fetchone()
+            emoji, name = row if row else ("❔", "Без категории")
+            text = f"✅ Записано: {emoji} {name} — <b>{amount:g}</b> <i>(авто)</i>"
+            if comment:
+                text += f"\n💬 {comment}"
+            warn = limit_warning(msg.from_user.id, auto_cat_id)
+            if warn:
+                text += f"\n\n{warn}"
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Изменить категорию", callback_data=f"recat:{exp_id}")
+            ]])
+            await msg.answer(text, reply_markup=kb)
+            return
+
     exp_id = save_expense(msg.from_user.id, None, amount, comment)
     preview = f"💸 <b>{amount:g}</b>"
     if comment:
@@ -645,6 +1081,45 @@ async def on_text(msg: Message, state: FSMContext):
 
 
 # ---------- Запуск ----------
+async def recurring_scheduler(bot: Bot):
+    """Фоновая задача: раз в час проверяет регулярные платежи и записывает их."""
+    while True:
+        try:
+            today = datetime.now()
+            today_date = today.strftime("%Y-%m-%d")
+            day = today.day
+            with closing(db_connect()) as conn:
+                due = conn.execute(
+                    "SELECT r.id, r.user_id, r.name, r.amount, r.category_id, "
+                    "       c.emoji, c.name "
+                    "FROM recurring r JOIN categories c ON c.id = r.category_id "
+                    "WHERE r.day_of_month = ? "
+                    "  AND (r.last_run_date IS NULL OR r.last_run_date < ?)",
+                    (day, today_date),
+                ).fetchall()
+            for rid, uid, name, amount, cat_id, emoji, cname in due:
+                save_expense(uid, cat_id, amount, name)
+                with closing(db_connect()) as conn, conn:
+                    conn.execute(
+                        "UPDATE recurring SET last_run_date = ? WHERE id = ?",
+                        (today_date, rid),
+                    )
+                try:
+                    text = (
+                        f"🔁 Автосписание: <b>{name}</b> — {amount:g} → "
+                        f"{emoji} {cname}"
+                    )
+                    warn = limit_warning(uid, cat_id)
+                    if warn:
+                        text += f"\n\n{warn}"
+                    await bot.send_message(uid, text)
+                except Exception as e:
+                    logging.warning("Не удалось уведомить %s: %s", uid, e)
+        except Exception as e:
+            logging.exception("recurring_scheduler error: %s", e)
+        await asyncio.sleep(3600)  # раз в час
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit(
@@ -662,6 +1137,7 @@ async def main():
     )
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    asyncio.create_task(recurring_scheduler(bot))
     await dp.start_polling(bot)
 
 
