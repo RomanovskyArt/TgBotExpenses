@@ -23,7 +23,12 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 # ---------- Конфиг ----------
@@ -35,6 +40,10 @@ except ImportError:
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 DB_PATH = os.getenv("DB_PATH", "expenses.db")
+
+PRO_BUTTON_TEXT = "⭐ Купить Pro навсегда"
+PRO_PRICE_STARS = 1  # минимально возможная цена в Telegram Stars
+PRO_PAYLOAD = "pro_forever_v1"
 
 DEFAULT_CATEGORIES = [
     ("🍔", "Еда"),
@@ -85,6 +94,32 @@ def db_init() -> None:
             CREATE INDEX IF NOT EXISTS idx_exp_user_created
                 ON expenses(user_id, created_at);
             """
+        )
+        # Миграция: колонки подписки Pro
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "is_pro" not in existing:
+            conn.execute("ALTER TABLE users ADD COLUMN is_pro INTEGER NOT NULL DEFAULT 0")
+        if "pro_since" not in existing:
+            conn.execute("ALTER TABLE users ADD COLUMN pro_since TEXT")
+        if "pro_charge_id" not in existing:
+            conn.execute("ALTER TABLE users ADD COLUMN pro_charge_id TEXT")
+
+
+def is_user_pro(user_id: int) -> bool:
+    with closing(db_connect()) as conn:
+        row = conn.execute(
+            "SELECT is_pro FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return bool(row and row[0])
+
+
+def mark_user_pro(user_id: int, charge_id: str) -> None:
+    with closing(db_connect()) as conn, conn:
+        conn.execute(
+            "UPDATE users SET is_pro = 1, "
+            "pro_since = datetime('now'), pro_charge_id = ? "
+            "WHERE user_id = ?",
+            (charge_id, user_id),
         )
 
 
@@ -244,6 +279,17 @@ def stats_kb() -> InlineKeyboardMarkup:
     )
 
 
+def main_reply_kb(user_id: int):
+    """Постоянная reply-клавиатура. Кнопку Pro показываем только не-Pro юзерам."""
+    if is_user_pro(user_id):
+        return ReplyKeyboardRemove()
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=PRO_BUTTON_TEXT)]],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def categories_manage_kb(user_id: int) -> InlineKeyboardMarkup:
     buttons = []
     for cid, emoji, name in list_categories(user_id):
@@ -272,7 +318,8 @@ async def on_start(msg: Message):
         "Команды:\n"
         "/stats — статистика\n"
         "/categories — управление категориями\n"
-        "/help — помощь"
+        "/help — помощь",
+        reply_markup=main_reply_kb(msg.from_user.id),
     )
 
 
@@ -422,6 +469,49 @@ async def cb_pick_category(cq: CallbackQuery):
         text = "✅ Записано."
     await cq.message.edit_text(text)
     await cq.answer("Сохранено")
+
+
+# ----- Pro-подписка (Telegram Stars) -----
+@router.message(F.text == PRO_BUTTON_TEXT)
+async def on_buy_pro(msg: Message):
+    ensure_user(msg.from_user.id, msg.from_user.username)
+    if is_user_pro(msg.from_user.id):
+        await msg.answer(
+            "✨ У тебя уже есть Pro-подписка. Спасибо за поддержку!",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return
+    await msg.bot.send_invoice(
+        chat_id=msg.chat.id,
+        title="Pro-подписка навсегда",
+        description=(
+            "Разовая покупка. Поддержка разработки и доступ ко всем "
+            "будущим Pro-функциям бота — навсегда."
+        ),
+        payload=PRO_PAYLOAD,
+        provider_token="",  # пусто для Telegram Stars
+        currency="XTR",
+        prices=[LabeledPrice(label="Pro навсегда", amount=PRO_PRICE_STARS)],
+    )
+
+
+@router.pre_checkout_query()
+async def on_pre_checkout(query: PreCheckoutQuery):
+    # Подтверждаем все платежи. Проверок тут не надо — цена фиксированная.
+    await query.answer(ok=True)
+
+
+@router.message(F.successful_payment)
+async def on_successful_payment(msg: Message):
+    payment = msg.successful_payment
+    charge_id = payment.telegram_payment_charge_id or payment.provider_payment_charge_id or ""
+    mark_user_pro(msg.from_user.id, charge_id)
+    await msg.answer(
+        "🎉 <b>Оплата прошла!</b>\n\n"
+        "Теперь у тебя Pro-подписка навсегда. "
+        "Новые Pro-функции будут добавляться — ты получишь их автоматически.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @router.message(F.text)
