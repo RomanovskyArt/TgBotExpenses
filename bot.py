@@ -279,14 +279,14 @@ def stats_kb() -> InlineKeyboardMarkup:
     )
 
 
-def main_reply_kb(user_id: int):
-    """Постоянная reply-клавиатура. Кнопку Pro показываем только не-Pro юзерам."""
+def pro_inline_kb(user_id: int):
+    """Inline-кнопка Pro под сообщением. None — если юзер уже Pro."""
     if is_user_pro(user_id):
-        return ReplyKeyboardRemove()
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=PRO_BUTTON_TEXT)]],
-        resize_keyboard=True,
-        is_persistent=True,
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=PRO_BUTTON_TEXT, callback_data="buy_pro")
+        ]]
     )
 
 
@@ -319,7 +319,7 @@ async def on_start(msg: Message):
         "/stats — статистика\n"
         "/categories — управление категориями\n"
         "/help — помощь",
-        reply_markup=main_reply_kb(msg.from_user.id),
+        reply_markup=pro_inline_kb(msg.from_user.id),
     )
 
 
@@ -472,17 +472,14 @@ async def cb_pick_category(cq: CallbackQuery):
 
 
 # ----- Pro-подписка (Telegram Stars) -----
-@router.message(F.text == PRO_BUTTON_TEXT)
-async def on_buy_pro(msg: Message):
-    ensure_user(msg.from_user.id, msg.from_user.username)
-    if is_user_pro(msg.from_user.id):
-        await msg.answer(
-            "✨ У тебя уже есть Pro-подписка. Спасибо за поддержку!",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+@router.callback_query(F.data == "buy_pro")
+async def cb_buy_pro(cq: CallbackQuery):
+    ensure_user(cq.from_user.id, cq.from_user.username)
+    if is_user_pro(cq.from_user.id):
+        await cq.answer("У тебя уже есть Pro ✨", show_alert=True)
         return
-    await msg.bot.send_invoice(
-        chat_id=msg.chat.id,
+    await cq.bot.send_invoice(
+        chat_id=cq.message.chat.id,
         title="Pro-подписка навсегда",
         description=(
             "Разовая покупка. Поддержка разработки и доступ ко всем "
@@ -493,6 +490,7 @@ async def on_buy_pro(msg: Message):
         currency="XTR",
         prices=[LabeledPrice(label="Pro навсегда", amount=PRO_PRICE_STARS)],
     )
+    await cq.answer()
 
 
 @router.pre_checkout_query()
@@ -510,7 +508,7 @@ async def on_successful_payment(msg: Message):
         "🎉 <b>Оплата прошла!</b>\n\n"
         "Теперь у тебя Pro-подписка навсегда. "
         "Новые Pro-функции будут добавляться — ты получишь их автоматически.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=ReplyKeyboardRemove(),  # на случай старой reply-клавиатуры
     )
 
 
