@@ -45,6 +45,16 @@ PRO_BUTTON_TEXT = "⭐ Купить Pro навсегда"
 PRO_PRICE_STARS = 1  # минимально возможная цена в Telegram Stars
 PRO_PAYLOAD = "pro_forever_v1"
 
+# Админы: список Telegram user_id через запятую в переменной ADMIN_IDS.
+# По умолчанию — владелец бота.
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "185202211").replace(" ", "").split(",") if x
+}
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
 DEFAULT_CATEGORIES = [
     ("🍔", "Еда"),
     ("☕️", "Кофе"),
@@ -469,6 +479,105 @@ async def cb_pick_category(cq: CallbackQuery):
         text = "✅ Записано."
     await cq.message.edit_text(text)
     await cq.answer("Сохранено")
+
+
+# ----- Админка -----
+def admin_main_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="👥 Пользователи", callback_data="adm:users")],
+    ])
+
+
+def admin_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")]
+    ])
+
+
+def admin_users_kb() -> InlineKeyboardMarkup:
+    with closing(db_connect()) as conn:
+        rows = conn.execute(
+            "SELECT user_id, username, is_pro FROM users ORDER BY created_at DESC LIMIT 50"
+        ).fetchall()
+    buttons = []
+    for uid, uname, is_pro in rows:
+        label = f"{'⭐' if is_pro else '·'} @{uname or uid} ({uid})"
+        buttons.append([
+            InlineKeyboardButton(text=label, callback_data="noop"),
+            InlineKeyboardButton(
+                text="🔽 Free" if is_pro else "🔼 Pro",
+                callback_data=f"adm:toggle:{uid}",
+            ),
+        ])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:main")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _admin_stats_text() -> str:
+    with closing(db_connect()) as conn:
+        users_total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        pro_total = conn.execute("SELECT COUNT(*) FROM users WHERE is_pro = 1").fetchone()[0]
+        exp_cnt, exp_sum = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM expenses"
+        ).fetchone()
+    stars_earned = pro_total * PRO_PRICE_STARS
+    return (
+        "📊 <b>Глобальная статистика</b>\n\n"
+        f"👥 Пользователей: <b>{users_total}</b>\n"
+        f"⭐ Pro-подписок: <b>{pro_total}</b>\n"
+        f"💫 Звёзд заработано: <b>{stars_earned}</b>\n\n"
+        f"💸 Всего расходов записано: <b>{exp_cnt}</b>\n"
+        f"💰 Суммарный объём: <b>{exp_sum:g}</b>"
+    )
+
+
+@router.message(Command("admin"))
+async def on_admin(msg: Message):
+    if not is_admin(msg.from_user.id):
+        return
+    await msg.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb())
+
+
+@router.callback_query(F.data.startswith("adm:"))
+async def cb_admin(cq: CallbackQuery):
+    if not is_admin(cq.from_user.id):
+        await cq.answer("Нет доступа", show_alert=True)
+        return
+    parts = cq.data.split(":")
+    action = parts[1]
+
+    if action == "main":
+        await cq.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_main_kb())
+    elif action == "stats":
+        await cq.message.edit_text(_admin_stats_text(), reply_markup=admin_back_kb())
+    elif action == "users":
+        await cq.message.edit_text(
+            "👥 <b>Пользователи</b> (последние 50)\nКнопка справа — переключить Pro/Free.",
+            reply_markup=admin_users_kb(),
+        )
+    elif action == "toggle" and len(parts) == 3:
+        uid = int(parts[2])
+        with closing(db_connect()) as conn, conn:
+            cur = conn.execute("SELECT is_pro FROM users WHERE user_id = ?", (uid,)).fetchone()
+            if cur:
+                new_val = 0 if cur[0] else 1
+                if new_val:
+                    conn.execute(
+                        "UPDATE users SET is_pro = 1, pro_since = datetime('now'), "
+                        "pro_charge_id = 'admin_grant' WHERE user_id = ?",
+                        (uid,),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE users SET is_pro = 0, pro_since = NULL, "
+                        "pro_charge_id = NULL WHERE user_id = ?",
+                        (uid,),
+                    )
+        await cq.message.edit_reply_markup(reply_markup=admin_users_kb())
+        await cq.answer("Обновлено")
+        return
+    await cq.answer()
 
 
 # ----- Pro-подписка (Telegram Stars) -----
